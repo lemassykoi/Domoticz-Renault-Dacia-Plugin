@@ -11,7 +11,7 @@
 
 
 """
-<plugin key="domoticz-renault-dacia" name="Renault / Dacia connect" author="Richeux" version="1.0.1" wikilink="https://github.com/Kask29/Domoticz-Renault-Dacia-Plugin" externallink="https://renault-api.readthedocs.io/en/latest/index.html">
+<plugin key="domoticz-renault-dacia" name="Renault / Dacia connect" author="Richeux" version="1.0.2" wikilink="https://github.com/lemassykoi/Domoticz-Renault-Dacia-Plugin" externallink="https://renault-api.readthedocs.io/en/latest/index.html">
     <description>
         <h2>Domoticz Renault / Dacia plugin</h2>
         This plugin permits to access, through the Renault/Dacia account credentials, to information about owned electric vehicles<br/>
@@ -26,6 +26,7 @@
         </param>
         <param field="Mode4" label="Fréquence d'actualisation" width="300px">
             <options>
+                <option label="5 minutes" value="5"/>
                 <option label="10 minutes" value="10"/>
                 <option label="15 minutes" value="15"/>
                 <option label="20 minutes" value="20"/>
@@ -61,13 +62,14 @@ from renault_api.renault_client import RenaultClient
 from renault_api.renault_account import RenaultAccount
 from renault_api.renault_account import RenaultVehicle
 from renault_api.kamereon import models
+from renault_api.exceptions import EndpointNotAvailableError
 from shutil import copy2
 import os
 
 class BasePlugin:
     enabled = False
     def __init__(self):
-        self._updateInterval = 30       # update interval in minutes (must be >5)
+        self._updateInterval = 30       # update interval in minutes (must be >=5 ; l'API Kamereon plafonne ~60 requêtes/heure)
         self._lastUpdate = None         # last time the server has been requested
         self._vehicle = None            # last vehicle data
         self._Battery = None            # last vehicle data
@@ -168,6 +170,39 @@ class BasePlugin:
             return True
         return False
         
+    async def stopCharge(self, vehicle, hardware_name):
+        """Arrête (met en pause) la charge.
+
+        Sur les véhicules KCM récents (Renault 5 E-Tech = R5E1VE, R4 E-Tech,
+        Twingo, Scenic E-Tech...), renault-api mappe 'actions/charge-stop' à None :
+        set_charge_stop() lève alors EndpointNotAvailableError
+        ("Endpoint 'actions/charge-stop' not available for model 'R5E1VE'").
+        Ces véhicules utilisent l'endpoint KCM 'charge/pause-resume'. On bascule
+        donc sur un POST direct de l'action 'pause' vers cet endpoint.
+        """
+        try:
+            await vehicle.set_charge_stop()
+            Domoticz.Log(f"Charge arrêtée pour {hardware_name} (set_charge_stop).")
+        except EndpointNotAvailableError as err:
+            Domoticz.Log(
+                f"'set_charge_stop' indisponible pour ce modèle ({err}). "
+                f"Bascule sur l'endpoint KCM 'charge/pause-resume' (action pause)..."
+            )
+            endpoint = (
+                "/commerce/v1/accounts/{account_id}/kamereon"
+                "/kcm/v1/vehicles/{vin}/charge/pause-resume"
+            )
+            body = {
+                "data": {
+                    "type": "ChargePauseResume",
+                    "attributes": {"action": "pause"},
+                }
+            }
+            await vehicle.http_post(endpoint, body)
+            Domoticz.Log(
+                f"Commande 'pause' envoyée pour {hardware_name} (KCM charge/pause-resume)."
+            )
+
     async def onAction(self, Action='update'):
         # Création de la session
         async with aiohttp.ClientSession() as websession:
@@ -272,7 +307,7 @@ class BasePlugin:
             elif Action == "stopCharge":
                 if Battery_plugStatus == 1:
                     Domoticz.Log(f"Arrêt de la charge de {hardware_name}.")
-                    await vehicle.set_charge_stop()
+                    await self.stopCharge(vehicle, hardware_name)
                 return
             else:
                 return

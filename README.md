@@ -1,6 +1,89 @@
 # Domoticz-Renault-Dacia-Plugin
 Plugin Domoticz afin d'obtenir les informations et piloter votre véhicule électrique Renault ou Dacia.
 
+## Nouveautés de ce fork (compatibilité Renault 5 E-Tech)
+
+Ce fork ([lemassykoi/Domoticz-Renault-Dacia-Plugin](https://github.com/lemassykoi/Domoticz-Renault-Dacia-Plugin)) ajoute la prise en charge des véhicules **KCM** récents de Renault, en particulier la **Renault 5 E-Tech** (code modèle `R5E1VE`). Objectif à terme : couvrir aussi la **R4 E-Tech** (`A4E1VE`) et la **Twingo** (`X071VE`).
+
+### Ce qui est corrigé / ajouté
+
+| Fonction | Avant (R5) | Après ce fork |
+|----------|-----------|---------------|
+| Relevé SoC / batterie | ✅ | ✅ |
+| Kilométrage (cockpit) | ✅ | ✅ |
+| Localisation GPS | ✅ | ✅ |
+| Lancement de charge | ✅ | ✅ |
+| **Arrêt de charge** | ❌ `Endpoint 'actions/charge-stop' not available for model 'R5E1VE'` | ✅ *(via bascule KCM, à valider en réel)* |
+| **Recharge programmée** | ❌ (l'arrêt planifié plantait) | ✅ *(dépend de l'arrêt de charge)* |
+| Intervalle mini de polling | 10 min | **5 min** |
+
+### Pourquoi l'arrêt de charge plantait, et comment c'est réparé
+
+La R5 est un véhicule de génération **KCM**. Dans la bibliothèque `renault-api`, le modèle `R5E1VE` déclare explicitement l'action d'arrêt comme indisponible :
+
+```python
+"R5E1VE": {  # Renault 5 E-TECH
+    "actions/charge-start": .../ev/settings (mode kcm-settings),
+    "actions/charge-stop": None,  # Not supported - use charger to stop
+    ...
+}
+```
+
+Résultat : l'appel `vehicle.set_charge_stop()` lève `EndpointNotAvailableError` **avant même d'envoyer une requête**, d'où l'erreur mentionnant `R5E1VE`. Comme la « recharge programmée » du plugin met simplement en file un ordre d'arrêt (via dzVents) en fin de créneau, elle échouait pour la même raison.
+
+**Correctif** : la méthode `stopCharge()` du plugin essaie d'abord `set_charge_stop()` (comportement normal, conservé pour Zoé, Spring, etc.). Si `EndpointNotAvailableError` est levée, elle bascule automatiquement sur l'endpoint KCM `charge/pause-resume` en envoyant directement, via `vehicle.http_post()`, la charge utile documentée :
+
+```
+POST /commerce/v1/accounts/{account_id}/kamereon/kcm/v1/vehicles/{vin}/charge/pause-resume
+{ "data": { "type": "ChargePauseResume", "attributes": { "action": "pause" } } }
+```
+
+Cette bascule est **générique** : tout véhicule KCM dont `actions/charge-stop` est `None` en bénéficie (utile pour la future compatibilité R4 / Twingo, sans code spécifique par modèle).
+
+> ⚠️ **À valider en conditions réelles.** L'auteur de `renault-api` a marqué l'arrêt comme « non supporté » (`use charger to stop`). Il n'est donc **pas garanti** que Renault accepte l'action `pause` sur toutes les R5 : selon l'abonnement (« Pack EV Remote Control ») et le firmware du véhicule, l'API peut répondre `err.func.wired.forbidden`. **Le lancement de charge**, lui, fonctionne nativement (mode `kcm-settings` : il désactive les programmes planifiés pour déclencher une charge immédiate).
+
+### Comment tester l'arrêt de charge
+
+1. Assurez-vous que le véhicule est **branché et en charge** (le dispositif *Branchée* = 1, *Charge en cours* = 1).
+2. Dans Domoticz, activez les logs (Configuration → Paramètres → onglet *Autres* → journalisation) ou surveillez le journal du plugin.
+3. Appuyez sur le dispositif **Arrêter la charge**.
+4. Dans les logs Domoticz, vous devriez voir l'une de ces situations :
+   - `Charge arrêtée pour <nom> (set_charge_stop).` → la voie standard a fonctionné.
+   - `'set_charge_stop' indisponible pour ce modèle (...). Bascule sur l'endpoint KCM 'charge/pause-resume' (action pause)...` suivi de `Commande 'pause' envoyée pour <nom> (KCM charge/pause-resume).` → la bascule KCM a été acceptée. **Vérifiez physiquement que la charge s'est bien arrêtée.**
+   - Une erreur `err.func.wired.forbidden` / `err.func.wired.overloaded` → voir ci-dessous.
+
+En complément, vous pouvez tester la commande brute hors Domoticz avec la CLI `renault-api` :
+
+```
+renault-api --account <ACCOUNT_ID> --vin <VIN> http post \
+  "/commerce/v1/accounts/{account_id}/kamereon/kcm/v1/vehicles/{vin}/charge/pause-resume" \
+  '{"data":{"type":"ChargePauseResume","attributes":{"action":"pause"}}}'
+```
+
+(et `"action":"resume"` pour relancer). Cela permet d'isoler un éventuel problème d'abonnement/permissions Renault d'un problème de plugin.
+
+### Fréquence d'actualisation et quota API
+
+L'API Kamereon de Renault **limite le nombre de requêtes à ~60 par heure** (au-delà : `err.func.wired.overloaded` / « You have reached your quota limit »). C'est une limite **côté serveur Renault**, indépendante du plugin.
+
+Une option **5 minutes** a été ajoutée (l'intervalle minimum était de 10 min).
+
+Estimation du coût par cycle selon le mode « Services actifs » choisi (≈ 1 requête de résolution du véhicule + 1 requête par service) :
+
+| Mode « Services actifs » | Requêtes/cycle (approx.) | À 5 min (12 cycles/h) | À 10 min (6 cycles/h) |
+|--------------------------|:------------------------:|:---------------------:|:---------------------:|
+| Cockpit + Batterie + Localisation (`111`) | ~4 | ~48/h | ~24/h |
+| Cockpit + Batterie (`110`) | ~3 | ~36/h | ~18/h |
+| Batterie seule (`010`) | ~2 | ~24/h | ~12/h |
+
+⚠️ À 5 min en mode complet (`111`) on est **sous le plafond mais serré** : chaque commande manuelle (Mise à jour / Lancer / Arrêter la charge) déclenche un rafraîchissement complet qui consomme des requêtes supplémentaires. **En cas d'erreurs de quota**, augmentez l'intervalle ou réduisez les « Services actifs ».
+
+### Limites connues
+
+- L'arrêt de charge R5 via `pause-resume` reste **à confirmer** sur le terrain (voir avertissement plus haut).
+- La « recharge programmée » du plugin est gérée **côté Domoticz** (dzVents planifie un ON puis un OFF), et non via l'API de planification native Renault. Elle dépend donc du bon fonctionnement des ordres de lancement/arrêt.
+- R4 E-Tech et Twingo ne sont **pas encore testées** ; la bascule KCM générique devrait toutefois s'appliquer si leur `actions/charge-stop` est aussi `None`.
+
 ## Prérequis
 La voiture doit être connectée à internet et disponible via les appli officielles de Renault ou Dacia.
 
@@ -18,7 +101,9 @@ Cloner le dépôt dans le répertoire <i>plugins</i> de votre installation Domot
 Par exemple sous debian :
 
 <code>cd chemin_domoticz/plugins
- git clone https://github.com/Kask29/Domoticz-Renault-Dacia-Plugin</code>
+ git clone https://github.com/lemassykoi/Domoticz-Renault-Dacia-Plugin</code>
+
+> Note : ce dépôt est un fork de [Kask29/Domoticz-Renault-Dacia-Plugin](https://github.com/Kask29/Domoticz-Renault-Dacia-Plugin) ajoutant la compatibilité Renault 5 E-Tech (voir « Nouveautés de ce fork » ci-dessus).
 
 ### Configuration
 Dans <i>Domoticz / Configuration / Matériel</i> --> ajouter le plugin de type <i>Renault / Dacia connect</i> en le nommant par exemple <b>Spring</b> et rentrez les informations nécessaires à son fonctionnement :
@@ -43,3 +128,15 @@ Une fois ajouté, le plugin va créer seul :
 Toute nouvelle planification annule la planifiation précédente.
 
 La planification n'est valable qu'une seule fois, mais rien ne vous empêche de créer vos scénarios personnalisés (comme habituellement avec Domoticz) basés sur les dispositifs du plugin.
+
+## Changelog
+
+### v1.0.2 (fork lemassykoi)
+- **Compatibilité Renault 5 E-Tech (`R5E1VE`)** : l'arrêt de charge bascule automatiquement sur l'endpoint KCM `charge/pause-resume` (action `pause`) quand `set_charge_stop()` n'est pas disponible pour le modèle (`EndpointNotAvailableError`). Correction indirecte de la « recharge programmée » qui dépend de l'arrêt de charge. *(À valider en conditions réelles.)*
+- Bascule **générique** : profite aussi aux futurs modèles KCM (R4 E-Tech, Twingo…) sans code spécifique.
+- Ajout de l'option de fréquence d'actualisation **5 minutes** (minimum précédent : 10 min).
+- Documentation : quota API (~60 req/h), guide de test de l'arrêt de charge, limites connues.
+- Mise à jour des liens (wiki/clone) vers le fork.
+
+### v1.0.1 et antérieures
+Voir le dépôt d'origine [Kask29/Domoticz-Renault-Dacia-Plugin](https://github.com/Kask29/Domoticz-Renault-Dacia-Plugin).
