@@ -40,7 +40,11 @@ POST /commerce/v1/accounts/{account_id}/kamereon/kcm/v1/vehicles/{vin}/charge/pa
 
 Cette bascule est **générique** : tout véhicule KCM dont `actions/charge-stop` est `None` en bénéficie (utile pour la future compatibilité R4 / Twingo, sans code spécifique par modèle).
 
-> ⚠️ **À valider en conditions réelles.** L'auteur de `renault-api` a marqué l'arrêt comme « non supporté » (`use charger to stop`). Il n'est donc **pas garanti** que Renault accepte l'action `pause` sur toutes les R5 : selon l'abonnement (« Pack EV Remote Control ») et le firmware du véhicule, l'API peut répondre `err.func.wired.forbidden`. **Le lancement de charge**, lui, fonctionne nativement (mode `kcm-settings` : il désactive les programmes planifiés pour déclencher une charge immédiate).
+**Pourquoi ce choix est solide (et pas un bricolage) :** le pause-resume KCM est *déjà* le mécanisme d'arrêt utilisé nativement par `renault-api` pour d'autres véhicules KCM — la **Zoe phase 2** (`X102VE`) et la **Dacia Spring** (`XBG1VE`) mappent toutes deux `actions/charge-stop` vers `charge-stop-via-pause-resume`. Ce fork applique donc simplement le même mécanisme à la R5. De plus, dans `renault-api`, la ligne `actions/charge-stop: None` de la R5 est la **seule** de son bloc sans code d'erreur Renault à l'appui (les autres indisponibilités citent `err.func.wired.forbidden`, `not-found`, etc.) : la mention « use charger to stop » ressemble à une conclusion prudente du contributeur plutôt qu'à un refus API réellement constaté sur l'endpoint pause-resume.
+
+> ℹ️ Le payload historique `{"action":"stop"}` visible dans la doc sur `actions/charging-start` concerne l'ancien endpoint **KCA** (`kca/car-adapter/...`) ; il **ne s'applique pas** à la R5, qui est KCM. Utiliser la High-level API (`set_charge_stop()`) ne suffit pas non plus : elle échoue *avant* tout appel réseau car le mapping du modèle vaut `None`. Le `http_post()` direct vers l'endpoint KCM est donc le bon contournement.
+
+> ⚠️ **À confirmer sur le terrain.** L'action `pause` reste à valider sur la R5 précise : selon l'abonnement (« Pack EV Remote Control ») et le firmware, l'API peut répondre `err.func.wired.forbidden`. Le plugin journalise désormais la **réponse de l'API** (ou l'erreur exacte) après un arrêt, pour faciliter le diagnostic. **Le lancement de charge**, lui, fonctionne nativement (mode `kcm-settings` : il désactive les programmes planifiés pour déclencher une charge immédiate).
 
 ### Comment tester l'arrêt de charge
 

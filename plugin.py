@@ -171,18 +171,22 @@ class BasePlugin:
         return False
         
     async def stopCharge(self, vehicle, hardware_name):
-        """Arrête (met en pause) la charge.
+        """Arrête la charge.
 
         Sur les véhicules KCM récents (Renault 5 E-Tech = R5E1VE, R4 E-Tech,
-        Twingo, Scenic E-Tech...), renault-api mappe 'actions/charge-stop' à None :
+        Twingo...), renault-api mappe 'actions/charge-stop' à None :
         set_charge_stop() lève alors EndpointNotAvailableError
         ("Endpoint 'actions/charge-stop' not available for model 'R5E1VE'").
-        Ces véhicules utilisent l'endpoint KCM 'charge/pause-resume'. On bascule
-        donc sur un POST direct de l'action 'pause' vers cet endpoint.
+
+        Ces véhicules KCM s'arrêtent via l'endpoint 'charge/pause-resume'
+        (action 'pause'). C'est exactement le mécanisme que renault-api utilise
+        déjà en natif pour la Zoe phase 2 (X102VE) et la Dacia Spring (XBG1VE),
+        toutes deux KCM. On bascule donc sur un POST direct vers cet endpoint,
+        avec le body officiel (type ChargePauseResume / action pause).
         """
         try:
-            await vehicle.set_charge_stop()
-            Domoticz.Log(f"Charge arrêtée pour {hardware_name} (set_charge_stop).")
+            resp = await vehicle.set_charge_stop()
+            Domoticz.Log(f"Charge arrêtée pour {hardware_name} (set_charge_stop). Réponse : {resp}")
         except EndpointNotAvailableError as err:
             Domoticz.Log(
                 f"'set_charge_stop' indisponible pour ce modèle ({err}). "
@@ -198,10 +202,19 @@ class BasePlugin:
                     "attributes": {"action": "pause"},
                 }
             }
-            await vehicle.http_post(endpoint, body)
-            Domoticz.Log(
-                f"Commande 'pause' envoyée pour {hardware_name} (KCM charge/pause-resume)."
-            )
+            try:
+                resp = await vehicle.http_post(endpoint, body)
+                Domoticz.Log(
+                    f"Commande 'pause' acceptée pour {hardware_name} "
+                    f"(KCM charge/pause-resume). Réponse : {getattr(resp, 'raw_data', resp)}. "
+                    f"Vérifiez que la charge s'est bien arrêtée côté véhicule."
+                )
+            except Exception as kcm_err:
+                Domoticz.Error(
+                    f"Échec de l'arrêt de charge KCM pour {hardware_name} : {kcm_err}. "
+                    f"Si l'erreur est 'err.func.wired.forbidden', un abonnement Renault "
+                    f"(Pack EV Remote Control) est probablement requis."
+                )
 
     async def onAction(self, Action='update'):
         # Création de la session
