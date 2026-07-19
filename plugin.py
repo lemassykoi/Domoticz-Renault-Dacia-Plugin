@@ -11,7 +11,7 @@
 
 
 """
-<plugin key="domoticz-renault-dacia" name="Renault / Dacia connect" author="Richeux" version="1.0.2" wikilink="https://github.com/lemassykoi/Domoticz-Renault-Dacia-Plugin" externallink="https://renault-api.readthedocs.io/en/latest/index.html">
+<plugin key="domoticz-renault-dacia" name="Renault / Dacia connect" author="Richeux" version="1.1.0" wikilink="https://github.com/lemassykoi/Domoticz-Renault-Dacia-Plugin" externallink="https://renault-api.readthedocs.io/en/latest/index.html">
     <description>
         <h2>Domoticz Renault / Dacia plugin</h2>
         This plugin permits to access, through the Renault/Dacia account credentials, to information about owned electric vehicles<br/>
@@ -49,6 +49,10 @@
                 <option label="Aucun" value="0"/>
             </options>
         </param>
+        <param field="Mode6" label="IDX capteur puissance de charge (Shelly) - détection 0W à l'arrêt R5" width="150px" />
+        <param field="SerialPort" label="IDX relais/interrupteur Shelly - coupe le courant après arrêt R5" width="150px" />
+        <param field="Address" label="IP API Domoticz locale (lecture capteur / pilotage relais)" width="150px" default="127.0.0.1" />
+        <param field="Port" label="Port API Domoticz locale (web UI, souvent 8080 ou 80)" width="100px" default="8080" />
     </params>
 </plugin>
 """
@@ -99,8 +103,7 @@ class BasePlugin:
             Domoticz.Device(Name="Autonomie batterie", Unit=3, TypeName="Custom", Used=1, Options={'Custom': '1;km'}).Create()
             Domoticz.Device(Name="Energie batterie", Unit=4, TypeName="Custom", Used=1, Options={'Custom': '1;kWh'}).Create()
             Domoticz.Device(Name="Capacité batterie", Unit=5, TypeName="Custom", Used=1, Options={'Custom': '1;kWh'}).Create()
-            Domoticz.Device(Name="Branchée", Unit=6, TypeName="Custom", Used=1, Options={'Custom': '1;Plug'}).Create()
-            Domoticz.Device(Name="Charge en cours", Unit=7, TypeName="Custom", Used=1, Options={'Custom': '1;Charge'}).Create()
+            # Unités 6 (Branchée) et 7 (Charge en cours) créées plus bas en Selector Switch (dropdown)
             Domoticz.Device(Name="Temps charge restant", Unit=8, TypeName="Text", Used=1).Create()
             Domoticz.Device(Name="Puissance de charge", Unit=9, TypeName="Custom", Used=1, Options={'Custom': '1;kWh'}).Create()
             Domoticz.Device(Name="Compteur km", Unit=10, Type=113, Subtype=0, Used=1, Switchtype=3).Create()
@@ -118,6 +121,21 @@ class BasePlugin:
             #Domoticz.Device(Name="Arrêter la clim", Unit=24, TypeName="Switch", Used=1, Switchtype=9).Create()
             # faire des evennements si l'heure >xxx et charge < xx alors lancer la charge. Si charge > 80% alors arreter la charge, etc.
             Domoticz.Log(f"Devices created for {hardware_name} !")
+        # Indicateurs "Branchée" (Unit 6) et "Charge en cours" (Unit 7) en Selector Switch (dropdown).
+        # Créés/recréés hors du bloc ci-dessus pour permettre la migration : supprimez ces 2
+        # dispositifs dans Domoticz puis redémarrez le plugin pour les recréer en sélecteurs.
+        if 6 not in Devices:
+            Domoticz.Device(
+                Name="Branchée", Unit=6, TypeName="Selector Switch", Used=1,
+                Options={"LevelActions": "|", "LevelNames": "Débranchée|Branchée",
+                         "LevelOffHidden": "false", "SelectorStyle": "1"}
+            ).Create()
+        if 7 not in Devices:
+            Domoticz.Device(
+                Name="Charge en cours", Unit=7, TypeName="Selector Switch", Used=1,
+                Options={"LevelActions": "||", "LevelNames": "Arrêtée|En charge|Erreur",
+                         "LevelOffHidden": "false", "SelectorStyle": "1"}
+            ).Create()
         copy2('./plugins/Dacia/Dacia.html', './www/templates/Dacia.html')
         os.mkdir('./www/templates/Dacia')
         copy2('./plugins/Dacia/icone/actualiser.png', './www/templates/Dacia/actualiser.png')
@@ -170,51 +188,180 @@ class BasePlugin:
             return True
         return False
         
-    async def stopCharge(self, vehicle, hardware_name):
+    # Endpoint KCM des réglages de charge (Renault 5 E-Tech, etc.)
+    EV_SETTINGS_ENDPOINT = (
+        "/commerce/v1/accounts/{account_id}/kamereon/kcm/v1/vehicles/{vin}/ev/settings"
+    )
+    # Détection de l'arrêt effectif de la charge via le capteur de puissance Shelly.
+    # Mesuré en réel : ~2350 W en charge, ~3 W à l'arrêt -> seuil 10 W largement suffisant.
+    ZEROWATT_TIMEOUT = 120    # secondes max d'attente avant abandon
+    ZEROWATT_INTERVAL = 8     # secondes entre deux lectures
+    ZEROWATT_THRESHOLD = 10   # W : en dessous, la charge est considérée arrêtée
+    SHELLY_ON_DELAY = 3       # secondes d'attente après allumage du relais (retour du courant)
+
+    async def stopCharge(self, vehicle, websession, hardware_name):
         """Arrête la charge.
 
-        Sur les véhicules KCM récents (Renault 5 E-Tech = R5E1VE, R4 E-Tech,
-        Twingo...), renault-api mappe 'actions/charge-stop' à None :
-        set_charge_stop() lève alors EndpointNotAvailableError
-        ("Endpoint 'actions/charge-stop' not available for model 'R5E1VE'").
+        Zoé/Spring/etc. : arrêt standard via set_charge_stop().
 
-        Ces véhicules KCM s'arrêtent via l'endpoint 'charge/pause-resume'
-        (action 'pause'). C'est exactement le mécanisme que renault-api utilise
-        déjà en natif pour la Zoe phase 2 (X102VE) et la Dacia Spring (XBG1VE),
-        toutes deux KCM. On bascule donc sur un POST direct vers cet endpoint,
-        avec le body officiel (type ChargePauseResume / action pause).
+        Renault 5 E-Tech (R5E1VE) et autres véhicules KCM : renault-api mappe
+        'actions/charge-stop' à None (commentaire de la lib : "Not supported -
+        use charger to stop") et 'charge/pause-resume' renvoie
+        'err.func.wired.forbidden' (testé en réel sur cette R5). Comme dans
+        l'appli MyRenault (aucun bouton "stop" direct), on arrête la charge en
+        ACTIVANT le planning de charge, puis on coupe proprement le courant :
+
+        Séquence validée en conditions réelles sur R5 E-Tech :
+        1. Activer UN programme de charge -> la charge s'arrête (~3 W).
+        2. Attendre que le capteur Shelly (IDX Mode6) passe sous 10 W.
+        3. COUPER le relais Shelly (IDX SerialPort) -> AVANT de désactiver
+           le planning. C'est indispensable : désactiver le planning alors que
+           le courant est présent RELANCE immédiatement la charge (constaté).
+        4. Désactiver/restaurer le planning (plus de courant -> pas de relance).
         """
         try:
             resp = await vehicle.set_charge_stop()
             Domoticz.Log(f"Charge arrêtée pour {hardware_name} (set_charge_stop). Réponse : {resp}")
         except EndpointNotAvailableError as err:
             Domoticz.Log(
-                f"'set_charge_stop' indisponible pour ce modèle ({err}). "
-                f"Bascule sur l'endpoint KCM 'charge/pause-resume' (action pause)..."
+                f"Arrêt standard indisponible pour ce modèle ({err}) : "
+                f"arrêt via planning + coupure Shelly (véhicule KCM type R5)."
             )
-            endpoint = (
-                "/commerce/v1/accounts/{account_id}/kamereon"
-                "/kcm/v1/vehicles/{vin}/charge/pause-resume"
+            await self._stopChargeViaSchedule(vehicle, websession, hardware_name)
+
+    async def _stopChargeViaSchedule(self, vehicle, websession, hardware_name):
+        """Arrête la charge d'un véhicule KCM (R5) : planning ON -> 0 W -> Shelly OFF -> planning restauré."""
+        resp = await vehicle.http_get(self.EV_SETTINGS_ENDPOINT)
+        settings = resp.raw_data
+        programs = settings.get("programs") or []
+        if not programs:
+            Domoticz.Error(
+                f"Aucun programme de charge sur {hardware_name} : impossible d'arrêter "
+                f"la charge via le planning. Arrêtez la charge côté borne/véhicule."
             )
-            body = {
-                "data": {
-                    "type": "ChargePauseResume",
-                    "attributes": {"action": "pause"},
-                }
-            }
-            try:
-                resp = await vehicle.http_post(endpoint, body)
-                Domoticz.Log(
-                    f"Commande 'pause' acceptée pour {hardware_name} "
-                    f"(KCM charge/pause-resume). Réponse : {getattr(resp, 'raw_data', resp)}. "
-                    f"Vérifiez que la charge s'est bien arrêtée côté véhicule."
-                )
-            except Exception as kcm_err:
-                Domoticz.Error(
-                    f"Échec de l'arrêt de charge KCM pour {hardware_name} : {kcm_err}. "
-                    f"Si l'erreur est 'err.func.wired.forbidden', un abonnement Renault "
-                    f"(Pack EV Remote Control) est probablement requis."
-                )
+            return
+        original_status = [p.get("programActivationStatus", False) for p in programs]
+
+        # 1. Activer UN seul programme suffit à arrêter la charge en cours.
+        programs[0]["programActivationStatus"] = True
+        await vehicle.http_post(self.EV_SETTINGS_ENDPOINT, settings)
+        Domoticz.Log(
+            f"Planning de charge activé pour {hardware_name} -> arrêt de charge demandé."
+        )
+
+        # 2. Attendre l'arrêt effectif (puissance < seuil).
+        stopped = await self._waitForZeroWatt(websession, hardware_name)
+        if not stopped:
+            # Charge non confirmée arrêtée : NE PAS couper le relais (coupure
+            # "sauvage" en pleine charge) et laisser le planning actif pour que
+            # la charge reste stoppée. Intervention manuelle possible.
+            Domoticz.Error(
+                f"Arrêt non confirmé pour {hardware_name} (puissance toujours élevée) : "
+                f"relais Shelly NON coupé et planning laissé ACTIF pour maintenir l'arrêt. "
+                f"Vérifiez le véhicule/la borne."
+            )
+            return
+
+        # 3. Couper le relais Shelly AVANT de désactiver le planning.
+        await self._setShellySwitch(websession, "Off", hardware_name)
+
+        # 4. Restaurer l'état initial du planning (désactivation). Plus de
+        #    courant -> aucune relance de charge.
+        resp2 = await vehicle.http_get(self.EV_SETTINGS_ENDPOINT)
+        settings2 = resp2.raw_data
+        for p, orig in zip(settings2.get("programs") or [], original_status):
+            p["programActivationStatus"] = orig
+        await vehicle.http_post(self.EV_SETTINGS_ENDPOINT, settings2)
+        Domoticz.Log(
+            f"Charge arrêtée proprement pour {hardware_name} : relais coupé puis planning restauré."
+        )
+
+    def _domoticzApiUrl(self, params):
+        """Construit une URL vers l'API JSON locale de Domoticz."""
+        addr = Parameters["Address"] or "127.0.0.1"
+        port = Parameters["Port"] or "8080"
+        return f"http://{addr}:{port}/json.htm?{params}"
+
+    async def _readDeviceField(self, websession, idx, field):
+        """Lit un champ (ex: 'Usage', 'Status') d'un device Domoticz par son IDX."""
+        if not idx:
+            return None
+        url = self._domoticzApiUrl(f"type=command&param=getdevices&rid={idx}")
+        try:
+            async with websession.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json(content_type=None)
+        except Exception as e:
+            Domoticz.Error(f"Lecture device Domoticz IDX {idx} impossible : {e}")
+            return None
+        result = data.get("result") or []
+        if not result:
+            return None
+        return result[0].get(field)
+
+    async def _readChargeWatts(self, websession):
+        """Lit la puissance de charge (W) depuis le capteur Domoticz (Mode6/IDX)."""
+        usage = await self._readDeviceField(websession, Parameters["Mode6"], "Usage")
+        if usage is None:
+            return None
+        try:
+            return float(str(usage).strip().split()[0])  # ex: "0 Watt" -> 0.0
+        except (ValueError, IndexError):
+            return None
+
+    async def _setShellySwitch(self, websession, cmd, hardware_name):
+        """Commute le relais Shelly (IDX SerialPort). cmd = 'On' ou 'Off'."""
+        idx = Parameters["SerialPort"]
+        if not idx:
+            Domoticz.Error(
+                f"Aucun IDX relais Shelly (SerialPort) configuré pour {hardware_name} : "
+                f"le courant n'a pas pu être commuté ({cmd})."
+            )
+            return False
+        url = self._domoticzApiUrl(f"type=command&param=switchlight&idx={idx}&switchcmd={cmd}")
+        try:
+            async with websession.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                await r.read()
+        except Exception as e:
+            Domoticz.Error(f"Commutation relais Shelly (IDX {idx}) -> {cmd} impossible : {e}")
+            return False
+        Domoticz.Log(f"Relais Shelly (IDX {idx}) commuté sur {cmd} pour {hardware_name}.")
+        return True
+
+    async def _ensureShellyOn(self, websession, hardware_name):
+        """Allume le relais Shelly s'il est éteint (courant requis pour charger)."""
+        idx = Parameters["SerialPort"]
+        if not idx:
+            return  # relais non piloté : on suppose le courant déjà présent
+        status = await self._readDeviceField(websession, idx, "Status")
+        if status is not None and str(status).lower() == "on":
+            Domoticz.Log(f"Relais Shelly (IDX {idx}) déjà allumé pour {hardware_name}.")
+            return
+        if await self._setShellySwitch(websession, "On", hardware_name):
+            await asyncio.sleep(self.SHELLY_ON_DELAY)  # laisser le courant s'établir
+
+    async def _waitForZeroWatt(self, websession, hardware_name):
+        """Attend que la puissance de charge retombe sous le seuil (capteur Shelly).
+
+        Retourne True si l'arrêt est confirmé, False en cas de timeout ou
+        d'absence de capteur configuré.
+        """
+        idx = Parameters["Mode6"]
+        if not idx:
+            Domoticz.Error(
+                "Aucun IDX capteur puissance (Mode6) configuré : impossible de confirmer "
+                "l'arrêt de charge. Le relais ne sera pas coupé automatiquement."
+            )
+            return False
+        waited = 0
+        while waited < self.ZEROWATT_TIMEOUT:
+            watts = await self._readChargeWatts(websession)
+            Domoticz.Log(f"Attente arrêt charge {hardware_name} : {watts} W (IDX {idx})")
+            if watts is not None and watts < self.ZEROWATT_THRESHOLD:
+                Domoticz.Log(f"Puissance < {self.ZEROWATT_THRESHOLD} W : charge arrêtée pour {hardware_name}.")
+                return True
+            await asyncio.sleep(self.ZEROWATT_INTERVAL)
+            waited += self.ZEROWATT_INTERVAL
+        return False
 
     async def onAction(self, Action='update'):
         # Création de la session
@@ -286,8 +433,13 @@ class BasePlugin:
                 Devices[3].Update(nValue=0, sValue=str(Battery_autonomy)) # Battery autonomy
                 Devices[4].Update(nValue=0, sValue=str(Battery_availableEnergy)) # Battery energy
                 Devices[5].Update(nValue=0, sValue=str(Battery_capacity)) # Battery capacity
-                Devices[6].Update(nValue=0, sValue=str(Battery_plugStatus)) # Battery plugged
-                Devices[7].Update(nValue=0, sValue=str(Battery_chargingStatus)) # Battery charging
+                # Selector "Branchée" : 0=Débranchée, 10=Branchée
+                plug_level = 10 if int(Battery_plugStatus) == 1 else 0
+                Devices[6].Update(nValue=(2 if plug_level else 0), sValue=str(plug_level))
+                # Selector "Charge en cours" : 0=Arrêtée, 10=En charge, 20=Erreur
+                cs = float(Battery_chargingStatus)
+                charge_level = 20 if cs < 0 else (10 if cs >= 1 else 0)
+                Devices[7].Update(nValue=(2 if charge_level else 0), sValue=str(charge_level))
                 Devices[8].Update(nValue=0, sValue=str(Battery_chargingRemainingTime)) # Battery remaining charging time - color may be changed by nvalue (0=gray, 1=green, 2=yellow, 3=orange, 4=red)
                 Devices[9].Update(nValue=0, sValue=str(Battery_chargingInstantaneousPower)) # Battery charging power
             if Parameters["Mode5"] == "111" or Parameters["Mode5"] == "100" or Parameters["Mode5"] == "101" or Parameters["Mode5"] == "110":
@@ -314,13 +466,17 @@ class BasePlugin:
                 return
             elif Action == "startCharge":
                 if Battery_plugStatus == 1:
+                    # Le courant doit être présent : on allume le relais Shelly
+                    # s'il est éteint (il l'est hors de sa plage programmée),
+                    # puis on lance la charge via l'API officielle.
+                    await self._ensureShellyOn(websession, hardware_name)
                     Domoticz.Log(f"Lancement de la charge de {hardware_name}.")
                     await vehicle.set_charge_start()
                 return
             elif Action == "stopCharge":
                 if Battery_plugStatus == 1:
                     Domoticz.Log(f"Arrêt de la charge de {hardware_name}.")
-                    await self.stopCharge(vehicle, hardware_name)
+                    await self.stopCharge(vehicle, websession, hardware_name)
                 return
             else:
                 return
