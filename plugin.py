@@ -65,8 +65,6 @@ from renault_api.renault_account import RenaultAccount
 from renault_api.renault_account import RenaultVehicle
 from renault_api.kamereon import models
 from renault_api.exceptions import EndpointNotAvailableError
-from shutil import copy2
-import os
 
 class BasePlugin:
     enabled = False
@@ -135,31 +133,14 @@ class BasePlugin:
                 Options={"LevelActions": "||", "LevelNames": "Arrêtée|En charge|Erreur",
                          "LevelOffHidden": "false", "SelectorStyle": "1"}
             ).Create()
-        copy2('./plugins/Dacia/Dacia.html', './www/templates/Dacia.html')
-        os.mkdir('./www/templates/Dacia')
-        copy2('./plugins/Dacia/icone/actualiser.png', './www/templates/Dacia/actualiser.png')
-        copy2('./plugins/Dacia/icone/Arreter_charger.png', './www/templates/Dacia/Arreter_charger.png')
-        copy2('./plugins/Dacia/icone/deprogrammer.png', './www/templates/Dacia/deprogrammer.png')
-        copy2('./plugins/Dacia/icone/programmer.png', './www/templates/Dacia/programmer.png')
-        copy2('./plugins/Dacia/icone/Recharger.png', './www/templates/Dacia/Recharger.png')
-        
-        copy2('./plugins/Dacia/Plugin_RenaultDacia_Programmer.lua', './scripts/dzVents/scripts/Plugin_RenaultDacia_Programmer.lua')
-        copy2('./plugins/Dacia/Plugin_RenaultDacia_Selector.lua', './scripts/dzVents/scripts/Plugin_RenaultDacia_Selector.lua')
-        
-            
+        # NB : le déploiement de la page web "Dacia" et des scripts dzVents
+        # (recharge programmée / arrêt auto au % cible) a été retiré : il
+        # plantait onStart (dossier ./plugins/Dacia/ inexistant) et est
+        # spécifique à la Dacia Spring. La planification peut être refaite
+        # via des évènements/timers Domoticz natifs si besoin.
+
     def onStop(self):
         Domoticz.Log("onStop called")
-        if (os.path.exists('./www/templates/Dacia.html')):
-            os.remove('./www/templates/Dacia.html')
-            os.remove('./www/templates/Dacia/actualiser.png')
-            os.remove('./www/templates/Dacia/Arreter_charger.png')
-            os.remove('./www/templates/Dacia/deprogrammer.png')
-            os.remove('./www/templates/Dacia/programmer.png')
-            os.remove('./www/templates/Dacia/Recharger.png')
-            os.rmdir('./www/templates/Dacia')
-            
-            os.remove('./scripts/dzVents/scripts/Plugin_RenaultDacia_Programmer.lua')
-            os.remove('./scripts/dzVents/scripts/Plugin_RenaultDacia_Selector.lua')
 	
     def onConnect(self, Connection, Status, Description):
         Domoticz.Log("onConnect called")
