@@ -69,27 +69,30 @@ Le **démarrage** de charge, lui, fonctionne nativement en mode `kcm-settings` (
 
 Le Shelly sert à deux choses, via **deux IDX Domoticz distincts** :
 
-| IDX (à configurer) | Rôle | Utilisation par le plugin |
-|--------------------|------|---------------------------|
-| **Capteur puissance** (`Mode6`) | Mesure la puissance de charge (W) | Lecture seule, pour détecter l'arrêt effectif (< 10 W) |
-| **Relais / interrupteur** (`SerialPort`) | Coupe/donne le courant à la borne | Allumé au démarrage ; **coupé après** l'arrêt (une fois à 0 W) |
+| Dispositif (IDX à configurer) | Rôle | Utilisation par le plugin |
+|-------------------------------|------|---------------------------|
+| **Capteur puissance** | Mesure la puissance de charge (W) | Lecture seule, pour détecter l'arrêt effectif (< 10 W) |
+| **Relais / interrupteur** | Coupe/donne le courant à la borne | Allumé au démarrage ; **coupé après** l'arrêt (une fois à 0 W) |
 
 Le but est de **ne plus couper « sauvagement » le courant** en pleine charge : on arrête d'abord la charge proprement via l'API Renault (retour à ~0 W), **puis** on coupe le relais. Si l'arrêt n'est pas confirmé (timeout, puissance toujours élevée), le plugin **ne coupe pas** le relais et **laisse le planning actif** (la charge reste stoppée), et journalise une erreur.
 
 ### Nouveaux paramètres de configuration (Hardware)
 
-À renseigner dans *Configuration → Matériel* sur le plugin :
+Seulement **deux champs** à renseigner dans *Configuration → Matériel* sur le plugin :
 
 | Champ | Description | Exemple |
 |-------|-------------|---------|
-| **IDX capteur puissance** (`Mode6`) | IDX du dispositif Domoticz mesurant la puissance de charge (Shelly) | `29` |
-| **IDX relais Shelly** (`SerialPort`) | IDX de l'interrupteur/relais Shelly qui coupe le courant | `28` |
-| **IP API Domoticz locale** (`Address`) | IP de l'API JSON Domoticz | `127.0.0.1` |
-| **Port API Domoticz locale** (`Port`) | Port de l'interface web Domoticz | `8080` ou `80` |
+| **IDX capteur puissance Shelly** | IDX du dispositif Domoticz mesurant la puissance de charge | `29` |
+| **IDX relais/interrupteur Shelly** | IDX du dispositif interrupteur qui coupe le courant | `28` |
 
-> ℹ️ Le **port** est celui de l'**interface web** de Domoticz (souvent `8080`, mais `80` sur certaines installations). Vérifiez-le : le plugin interroge `http://<Address>:<Port>/json.htm?...`.
+Le plugin interroge l'API JSON de Domoticz en local :
 
-> ℹ️ Si `IDX relais Shelly` (`SerialPort`) n'est **pas** renseigné, le plugin ne pilote pas le courant (il suppose le courant présent) : le démarrage n'allumera rien et l'arrêt ne coupera rien. Si `IDX capteur puissance` (`Mode6`) n'est pas renseigné, l'arrêt R5 **ne peut pas être confirmé** et le relais n'est pas coupé.
+- **l'hôte est codé en dur** sur `127.0.0.1` (le plugin s'exécute forcément sur la même machine que Domoticz) ;
+- **le port de l'interface web est auto-détecté** (essais successifs `8080` puis `80`) — rien à configurer.
+
+> ℹ️ Si l'**IDX relais** n'est **pas** renseigné, le plugin ne pilote pas le courant (il suppose le courant présent) : le démarrage n'allumera rien et l'arrêt ne coupera rien. Si l'**IDX capteur puissance** n'est pas renseigné, l'arrêt R5 **ne peut pas être confirmé** et le relais n'est pas coupé.
+
+> ⚙️ *Détail technique* : ces deux valeurs utilisent en interne les champs `Mode6` (capteur puissance) et `Address` (relais) du framework de plugin Domoticz. Le champ `Address` a été détourné pour l'IDX relais car les autres champs texte disponibles ne convenaient pas (`SerialPort` s'affiche en menu déroulant de ports USB). Si votre interface web Domoticz utilise un port autre que 8080/80, ajoutez-le à `DOMOTICZ_PORT_CANDIDATES` dans `plugin.py`.
 
 ### Migration des dispositifs « Branchée » et « Charge en cours »
 
@@ -199,7 +202,7 @@ La planification n'est valable qu'une seule fois, mais rien ne vous empêche de 
   - Ordre critique : coupure du relais **avant** désactivation du planning (sinon la charge redémarre — constaté).
   - Sécurité : si l'arrêt n'est pas confirmé (timeout / puissance élevée), le relais **n'est pas coupé** et le planning reste actif ; erreur journalisée.
 - **Démarrage de charge** : allume désormais le relais Shelly (s'il est éteint) avant `set_charge_start()`.
-- **Pilotage/lecture du Shelly** via l'API JSON locale de Domoticz. Nouveaux paramètres : `Mode6` (IDX capteur puissance), `SerialPort` (IDX relais), `Address`, `Port`.
+- **Pilotage/lecture du Shelly** via l'API JSON locale de Domoticz. Configuration réduite à **2 champs** (IDX capteur puissance + IDX relais) : l'hôte est codé en dur (`127.0.0.1`) et le port de l'interface web est **auto-détecté** (8080 puis 80).
 - **Dispositifs *Branchée* et *Charge en cours*** convertis de capteur texte en **listes déroulantes** (Selector Switch). Voir la section migration.
 - Option de fréquence d'actualisation **5 minutes** (minimum précédent : 10 min).
 - Documentation entièrement mise à jour : mécanisme réel, rôle du Shelly, paramètres, migration, procédure de test, quota API, limites.

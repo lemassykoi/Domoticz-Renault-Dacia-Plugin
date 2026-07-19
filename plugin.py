@@ -49,10 +49,8 @@
                 <option label="Aucun" value="0"/>
             </options>
         </param>
-        <param field="Mode6" label="IDX capteur puissance de charge (Shelly) - détection 0W à l'arrêt R5" width="150px" />
-        <param field="SerialPort" label="IDX relais/interrupteur Shelly - coupe le courant après arrêt R5" width="150px" />
-        <param field="Address" label="IP API Domoticz locale (lecture capteur / pilotage relais)" width="150px" default="127.0.0.1" />
-        <param field="Port" label="Port API Domoticz locale (web UI, souvent 8080 ou 80)" width="100px" default="8080" />
+        <param field="Mode6" label="IDX capteur puissance Shelly (détection arrêt R5, ex: 29)" width="100px" />
+        <param field="Address" label="IDX relais/interrupteur Shelly (coupe le courant, ex: 28)" width="100px" />
     </params>
 </plugin>
 """
@@ -79,6 +77,7 @@ class BasePlugin:
         self._Battery = None            # last vehicle data
         self._Cockpit = None            # last vehicle data
         self._Location = None           # last vehicle data
+        self._domoticzPort = None       # port de l'API web Domoticz (auto-détecté)
         return
         
     def onHeartbeat(self):
@@ -198,6 +197,10 @@ class BasePlugin:
     ZEROWATT_INTERVAL = 8     # secondes entre deux lectures
     ZEROWATT_THRESHOLD = 10   # W : en dessous, la charge est considérée arrêtée
     SHELLY_ON_DELAY = 3       # secondes d'attente après allumage du relais (retour du courant)
+    # API JSON locale de Domoticz : l'hôte est toujours la machine locale ;
+    # le port de l'interface web est auto-détecté (pas de champ à configurer).
+    DOMOTICZ_HOST = "127.0.0.1"
+    DOMOTICZ_PORT_CANDIDATES = ("8080", "80")
 
     async def stopCharge(self, vehicle, websession, hardware_name):
         """Arrête la charge.
@@ -276,22 +279,47 @@ class BasePlugin:
             f"Charge arrêtée proprement pour {hardware_name} : relais coupé puis planning restauré."
         )
 
-    def _domoticzApiUrl(self, params):
-        """Construit une URL vers l'API JSON locale de Domoticz."""
-        addr = Parameters["Address"] or "127.0.0.1"
-        port = Parameters["Port"] or "8080"
-        return f"http://{addr}:{port}/json.htm?{params}"
+    async def _detectDomoticzPort(self, websession):
+        """Auto-détecte le port de l'API web Domoticz locale (mis en cache)."""
+        if self._domoticzPort:
+            return self._domoticzPort
+        for port in self.DOMOTICZ_PORT_CANDIDATES:
+            url = f"http://{self.DOMOTICZ_HOST}:{port}/json.htm?type=command&param=getversion"
+            try:
+                async with websession.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    data = await r.json(content_type=None)
+            except Exception:
+                continue
+            if isinstance(data, dict) and data.get("status") == "OK":
+                self._domoticzPort = port
+                Domoticz.Log(f"API Domoticz détectée sur {self.DOMOTICZ_HOST}:{port}.")
+                return port
+        Domoticz.Error(
+            f"API web Domoticz introuvable sur {self.DOMOTICZ_HOST} "
+            f"(ports testés : {', '.join(self.DOMOTICZ_PORT_CANDIDATES)}). "
+            f"Lecture/pilotage Shelly impossible."
+        )
+        return None
+
+    async def _domoticzApiGet(self, websession, params):
+        """Appelle l'API JSON locale de Domoticz (hôte local, port auto-détecté)."""
+        port = await self._detectDomoticzPort(websession)
+        if not port:
+            return None
+        url = f"http://{self.DOMOTICZ_HOST}:{port}/json.htm?{params}"
+        try:
+            async with websession.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                return await r.json(content_type=None)
+        except Exception as e:
+            Domoticz.Error(f"Appel API Domoticz échoué ({params}) : {e}")
+            return None
 
     async def _readDeviceField(self, websession, idx, field):
         """Lit un champ (ex: 'Usage', 'Status') d'un device Domoticz par son IDX."""
         if not idx:
             return None
-        url = self._domoticzApiUrl(f"type=command&param=getdevices&rid={idx}")
-        try:
-            async with websession.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json(content_type=None)
-        except Exception as e:
-            Domoticz.Error(f"Lecture device Domoticz IDX {idx} impossible : {e}")
+        data = await self._domoticzApiGet(websession, f"type=command&param=getdevices&rid={idx}")
+        if not data:
             return None
         result = data.get("result") or []
         if not result:
@@ -299,7 +327,7 @@ class BasePlugin:
         return result[0].get(field)
 
     async def _readChargeWatts(self, websession):
-        """Lit la puissance de charge (W) depuis le capteur Domoticz (Mode6/IDX)."""
+        """Lit la puissance de charge (W) depuis le capteur Shelly (IDX Mode6)."""
         usage = await self._readDeviceField(websession, Parameters["Mode6"], "Usage")
         if usage is None:
             return None
@@ -309,27 +337,26 @@ class BasePlugin:
             return None
 
     async def _setShellySwitch(self, websession, cmd, hardware_name):
-        """Commute le relais Shelly (IDX SerialPort). cmd = 'On' ou 'Off'."""
-        idx = Parameters["SerialPort"]
+        """Commute le relais Shelly (IDX Address). cmd = 'On' ou 'Off'."""
+        idx = Parameters["Address"]
         if not idx:
             Domoticz.Error(
-                f"Aucun IDX relais Shelly (SerialPort) configuré pour {hardware_name} : "
+                f"Aucun IDX relais Shelly configuré pour {hardware_name} : "
                 f"le courant n'a pas pu être commuté ({cmd})."
             )
             return False
-        url = self._domoticzApiUrl(f"type=command&param=switchlight&idx={idx}&switchcmd={cmd}")
-        try:
-            async with websession.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                await r.read()
-        except Exception as e:
-            Domoticz.Error(f"Commutation relais Shelly (IDX {idx}) -> {cmd} impossible : {e}")
+        data = await self._domoticzApiGet(
+            websession, f"type=command&param=switchlight&idx={idx}&switchcmd={cmd}"
+        )
+        if not data or data.get("status") != "OK":
+            Domoticz.Error(f"Commutation relais Shelly (IDX {idx}) -> {cmd} échouée.")
             return False
         Domoticz.Log(f"Relais Shelly (IDX {idx}) commuté sur {cmd} pour {hardware_name}.")
         return True
 
     async def _ensureShellyOn(self, websession, hardware_name):
         """Allume le relais Shelly s'il est éteint (courant requis pour charger)."""
-        idx = Parameters["SerialPort"]
+        idx = Parameters["Address"]
         if not idx:
             return  # relais non piloté : on suppose le courant déjà présent
         status = await self._readDeviceField(websession, idx, "Status")
