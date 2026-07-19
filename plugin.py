@@ -11,19 +11,20 @@
 
 
 """
-<plugin key="domoticz-renault-dacia" name="Renault / Dacia connect" author="Richeux" version="1.1.0" wikilink="https://github.com/lemassykoi/Domoticz-Renault-Dacia-Plugin" externallink="https://renault-api.readthedocs.io/en/latest/index.html">
+<plugin key="domoticz-renault-dacia" name="Renault E-Tech (R5 / R4 / Twingo) connect" author="Richeux" version="1.2.0" wikilink="https://github.com/lemassykoi/Domoticz-Renault-Dacia-Plugin" externallink="https://renault-api.readthedocs.io/en/latest/index.html">
     <description>
-        <h2>Domoticz Renault / Dacia plugin</h2>
-        This plugin permits to access, through the Renault/Dacia account credentials, to information about owned electric vehicles<br/>
+        <h2>Domoticz Renault E-Tech (KCM) plugin</h2>
+        Plugin pour les Renault E-Tech nouvelle génération (KCM) : Renault 5 (R5E1VE),
+        Renault 4 (A4E1VE), Twingo. Accès aux données véhicule et pilotage de la charge
+        (démarrage/arrêt via l'API officielle + relais Shelly, cible de charge).<br/>
+        <em>Note : la clé du plugin (key) reste "domoticz-renault-dacia" pour ne pas
+        casser les installations existantes.</em>
     </description>
     <params>
         <param field="Username" label="Email address" width="300px" required="true" />
         <param field="Password" label="Password" width="300px" required="true" password="true" />
         <param field="Mode1" label="Accound id" width="300px" />
         <param field="Mode2" label="VIN" width="300px" />
-        <param field="Mode3" label="Capacité utile de la batterie (kWh)" width="300px" default="26.8">
-        <description>La capacité de la batterie est requise pour estimer les temps de chargement lors de la programmation. Nombre décimal séparé par un point.</description>
-        </param>
         <param field="Mode4" label="Fréquence d'actualisation" width="300px">
             <options>
                 <option label="5 minutes" value="5"/>
@@ -76,6 +77,7 @@ class BasePlugin:
         self._Cockpit = None            # last vehicle data
         self._Location = None           # last vehicle data
         self._domoticzPort = None       # port de l'API web Domoticz (auto-détecté)
+        self._pendingChargeTarget = None  # cible de charge (%) demandée via le sélecteur
         return
         
     def onHeartbeat(self):
@@ -94,33 +96,23 @@ class BasePlugin:
         if (len(Devices) == 0):
             hardware_name = Parameters["Name"]
             Domoticz.Log(f"No devices found for {hardware_name}. Creating devices.")
-            # Mesure
+            # Mesure (seules les données réellement fournies par la R5/KCM sont créées)
             Domoticz.Device(Name="Batterie", Unit=1, TypeName="Percentage", Used=1).Create()
-            Domoticz.Device(Name="Temperature batterie", Unit=2, TypeName="Custom", Used=1, Options={'Custom': '1;°C'}).Create()
             Domoticz.Device(Name="Autonomie batterie", Unit=3, TypeName="Custom", Used=1, Options={'Custom': '1;km'}).Create()
-            Domoticz.Device(Name="Energie batterie", Unit=4, TypeName="Custom", Used=1, Options={'Custom': '1;kWh'}).Create()
-            Domoticz.Device(Name="Capacité batterie", Unit=5, TypeName="Custom", Used=1, Options={'Custom': '1;kWh'}).Create()
             # Unités 6 (Branchée) et 7 (Charge en cours) créées plus bas en Selector Switch (dropdown)
             Domoticz.Device(Name="Temps charge restant", Unit=8, TypeName="Text", Used=1).Create()
-            Domoticz.Device(Name="Puissance de charge", Unit=9, TypeName="Custom", Used=1, Options={'Custom': '1;kWh'}).Create()
             Domoticz.Device(Name="Compteur km", Unit=10, Type=113, Subtype=0, Used=1, Switchtype=3).Create()
             Devices[10].Update(nValue=0, sValue=str(0)) # set default, if not set you make Domoticz crash
             Domoticz.Device(Name="Localisation", Unit=11, TypeName="Text", Used=1).Create()
             # Actionneur
             Domoticz.Device(Name="Mise à jour", Unit=12, TypeName="Switch", Used=1, Switchtype=9).Create()
             Domoticz.Device(Name="Lancer la charge", Unit=13, TypeName="Switch", Used=1, Switchtype=9).Create()
-            Domoticz.Device(Name="Arrêter la charge", Unit=14, TypeName="Switch", Used=1, Switchtype=10).Create()            
-            #Domoticz.Device(Name="Carburant autonomie", Unit=15, Type=243, Subtype=31, Used=0, Options={'Custom': '1;km'}).Create()    # not used
-            #Domoticz.Device(Name="Carburant quantité", Unit=16, Type=243, Subtype=31, Used=0, Options={'Custom': '1;L'}).Create()      # not used
-            Domoticz.Device(Name="Charge max programmée", Unit=17, TypeName="Switch", Used=1, Switchtype=18, Options={"LevelNames":"Off|20|30|40|50|60|70|80|90|100","LevelActions":"|","LevelOffHidden": "false","SelectorStyle": "1"}).Create() 
-
-            #Domoticz.Device(Name="Lancer la clim", Unit=23, TypeName="Switch", Used=1, Switchtype=9).Create()
-            #Domoticz.Device(Name="Arrêter la clim", Unit=24, TypeName="Switch", Used=1, Switchtype=9).Create()
-            # faire des evennements si l'heure >xxx et charge < xx alors lancer la charge. Si charge > 80% alors arreter la charge, etc.
+            Domoticz.Device(Name="Arrêter la charge", Unit=14, TypeName="Switch", Used=1, Switchtype=10).Create()
+            # Unité 17 (Cible de charge) créée plus bas en sélecteur.
             Domoticz.Log(f"Devices created for {hardware_name} !")
-        # Indicateurs "Branchée" (Unit 6) et "Charge en cours" (Unit 7) en Selector Switch (dropdown).
-        # Créés/recréés hors du bloc ci-dessus pour permettre la migration : supprimez ces 2
-        # dispositifs dans Domoticz puis redémarrez le plugin pour les recréer en sélecteurs.
+        # Dispositifs à liste déroulante (Selector Switch), créés/recréés hors du bloc
+        # ci-dessus pour permettre la migration : supprimez le dispositif concerné dans
+        # Domoticz puis redémarrez le plugin pour qu'il soit recréé au bon format.
         if 6 not in Devices:
             Domoticz.Device(
                 Name="Branchée", Unit=6, TypeName="Selector Switch", Used=1,
@@ -132,6 +124,15 @@ class BasePlugin:
                 Name="Charge en cours", Unit=7, TypeName="Selector Switch", Used=1,
                 Options={"LevelActions": "||", "LevelNames": "Arrêtée|En charge|Erreur",
                          "LevelOffHidden": "false", "SelectorStyle": "1"}
+            ).Create()
+        # Cible de charge (socTarget) : sélecteur 50..100 %, lu depuis l'API et
+        # réinscriptible (set_soc_levels). Niveaux : 0->50%, 10->60%, ... 50->100%.
+        if 17 not in Devices:
+            Domoticz.Device(
+                Name="Cible de charge", Unit=17, TypeName="Selector Switch", Used=1,
+                Options={"LevelActions": "||||||",
+                         "LevelNames": "50|60|70|80|90|100",
+                         "LevelOffHidden": "true", "SelectorStyle": "1"}
             ).Create()
         # NB : le déploiement de la page web "Dacia" et des scripts dzVents
         # (recharge programmée / arrêt auto au % cible) a été retiré : il
@@ -156,6 +157,13 @@ class BasePlugin:
             loop.run_until_complete(self.onAction("startCharge"))
         if Unit == 14:
             loop.run_until_complete(self.onAction("stopCharge"))
+        if Unit == 17:
+            # Sélecteur "Cible de charge" : niveau 0->50%, 10->60%, ... 50->100%
+            # Clamp 50..100 par sécurité (protège aussi si un ancien sélecteur
+            # "Charge max programmée" non migré est déclenché).
+            target = 50 + int(Level) // 10 * 10
+            self._pendingChargeTarget = max(50, min(100, target))
+            loop.run_until_complete(self.onAction("setChargeTarget"))
 	
     def onDisconnect(self, Connection):
         Domoticz.Log("onDisconnect called")
@@ -168,9 +176,12 @@ class BasePlugin:
             return True
         return False
         
-    # Endpoint KCM des réglages de charge (Renault 5 E-Tech, etc.)
+    # Endpoints KCM (Renault 5 E-Tech, R4, Twingo...)
     EV_SETTINGS_ENDPOINT = (
         "/commerce/v1/accounts/{account_id}/kamereon/kcm/v1/vehicles/{vin}/ev/settings"
+    )
+    SOC_LEVELS_ENDPOINT = (
+        "/commerce/v1/accounts/{account_id}/kamereon/kcm/v1/vehicles/{vin}/ev/soc-levels"
     )
     # Détection de l'arrêt effectif de la charge via le capteur de puissance Shelly.
     # Mesuré en réel : ~2350 W en charge, ~3 W à l'arrêt -> seuil 10 W largement suffisant.
@@ -371,6 +382,50 @@ class BasePlugin:
             waited += self.ZEROWATT_INTERVAL
         return False
 
+    @staticmethod
+    def _targetToLevel(target):
+        """Convertit une cible de charge (%) en niveau du sélecteur (50%->0 ... 100%->50)."""
+        lvl = (int(target) - 50) // 10 * 10
+        return max(0, min(50, lvl))
+
+    async def _updateChargeTargetDevice(self, vehicle):
+        """Lit la cible de charge (socTarget) et met à jour le sélecteur Unit 17."""
+        if 17 not in Devices:
+            return
+        try:
+            resp = await vehicle.http_get(self.SOC_LEVELS_ENDPOINT)
+            target = (resp.raw_data or {}).get("socTarget")
+        except Exception as e:
+            Domoticz.Error(f"Lecture cible de charge (soc-levels) impossible : {e}")
+            return
+        if target is None:
+            return
+        level = self._targetToLevel(target)
+        Domoticz.Log(f"Cible de charge : {target}% (niveau sélecteur {level}).")
+        Devices[17].Update(nValue=2, sValue=str(level))
+
+    async def setChargeTarget(self, vehicle, hardware_name):
+        """Écrit la cible de charge (socTarget) demandée via le sélecteur Unit 17."""
+        target = self._pendingChargeTarget
+        self._pendingChargeTarget = None
+        if target is None:
+            return
+        # On conserve le socMin actuel du véhicule.
+        try:
+            resp = await vehicle.http_get(self.SOC_LEVELS_ENDPOINT)
+            soc_min = (resp.raw_data or {}).get("socMin", 45)
+        except Exception as e:
+            Domoticz.Error(f"Lecture soc-levels avant écriture impossible : {e}")
+            soc_min = 45
+        try:
+            await vehicle.http_post(self.SOC_LEVELS_ENDPOINT, {"socMin": soc_min, "socTarget": target})
+        except Exception as e:
+            Domoticz.Error(f"Écriture cible de charge ({target}%) impossible pour {hardware_name} : {e}")
+            return
+        Domoticz.Log(f"Cible de charge réglée à {target}% pour {hardware_name} (socMin={soc_min}).")
+        if 17 in Devices:
+            Devices[17].Update(nValue=2, sValue=str(self._targetToLevel(target)))
+
     async def onAction(self, Action='update'):
         # Création de la session
         async with aiohttp.ClientSession() as websession:
@@ -414,33 +469,22 @@ class BasePlugin:
             self._vehicle = vehicle
             
             # Mise à jour des devices (toujours effectuée en amont des autres actions possibles)
-            Battery_capacity = Parameters["Mode3"] # La capacité de la batterie doit être indiquée manuellement car l'API retourne 0
             if Parameters["Mode5"] == "111" or Parameters["Mode5"] == "010" or Parameters["Mode5"] == "011" or Parameters["Mode5"] == "110":
                 Battery = await vehicle.get_battery_status()
                 Domoticz.Log("Battery status ok")
                 self._Battery = Battery
                 Battery_level = Battery.batteryLevel #int
-                Battery_temperature = Battery.batteryTemperature #int
                 Battery_autonomy = Battery.batteryAutonomy #int
-                Battery_availableEnergy = Battery.batteryAvailableEnergy #int
                 Battery_plugStatus = Battery.plugStatus #int
                 Battery_chargingStatus = Battery.chargingStatus #float
                 Battery_chargingRemainingTime = Battery.chargingRemainingTime #int
-                Battery_chargingInstantaneousPower = Battery.chargingInstantaneousPower #int
                 Domoticz.Log(f"Battery level : {Battery_level}%")
-                Domoticz.Log(f"Battery temperature : {Battery_temperature}°C")
                 Domoticz.Log(f"Battery autonomy : {Battery_autonomy} km")
-                Domoticz.Log(f"Battery available energy : {Battery_availableEnergy} kWh")
-                Domoticz.Log(f"Battery capacity : {Battery_capacity} kWh")
                 Domoticz.Log(f"Plug status : {Battery_plugStatus}")
                 Domoticz.Log(f"Charging status : {Battery_chargingStatus}")
-                Domoticz.Log(f"Charging remaining time : {Battery_chargingRemainingTime} ??")
-                Domoticz.Log(f"Instantaneous Power : {Battery_chargingInstantaneousPower} kWh")
+                Domoticz.Log(f"Charging remaining time : {Battery_chargingRemainingTime} min")
                 Devices[1].Update(nValue=0, sValue=str(Battery_level)) # Battery percentage
-                Devices[2].Update(nValue=0, sValue=str(Battery_temperature)) # Battery temperature
                 Devices[3].Update(nValue=0, sValue=str(Battery_autonomy)) # Battery autonomy
-                Devices[4].Update(nValue=0, sValue=str(Battery_availableEnergy)) # Battery energy
-                Devices[5].Update(nValue=0, sValue=str(Battery_capacity)) # Battery capacity
                 # Selector "Branchée" : 0=Débranchée, 10=Branchée
                 plug_level = 10 if int(Battery_plugStatus) == 1 else 0
                 Devices[6].Update(nValue=(2 if plug_level else 0), sValue=str(plug_level))
@@ -448,8 +492,9 @@ class BasePlugin:
                 cs = float(Battery_chargingStatus)
                 charge_level = 20 if cs < 0 else (10 if cs >= 1 else 0)
                 Devices[7].Update(nValue=(2 if charge_level else 0), sValue=str(charge_level))
-                Devices[8].Update(nValue=0, sValue=str(Battery_chargingRemainingTime)) # Battery remaining charging time - color may be changed by nvalue (0=gray, 1=green, 2=yellow, 3=orange, 4=red)
-                Devices[9].Update(nValue=0, sValue=str(Battery_chargingInstantaneousPower)) # Battery charging power
+                Devices[8].Update(nValue=0, sValue=str(Battery_chargingRemainingTime)) # Battery remaining charging time
+                # Cible de charge (socTarget) -> sélecteur Unit 17 (lecture)
+                await self._updateChargeTargetDevice(vehicle)
             if Parameters["Mode5"] == "111" or Parameters["Mode5"] == "100" or Parameters["Mode5"] == "101" or Parameters["Mode5"] == "110":
                 Cockpit = await vehicle.get_cockpit()
                 Domoticz.Log("Cockpit ok")
@@ -485,6 +530,9 @@ class BasePlugin:
                 if Battery_plugStatus == 1:
                     Domoticz.Log(f"Arrêt de la charge de {hardware_name}.")
                     await self.stopCharge(vehicle, websession, hardware_name)
+                return
+            elif Action == "setChargeTarget":
+                await self.setChargeTarget(vehicle, hardware_name)
                 return
             else:
                 return

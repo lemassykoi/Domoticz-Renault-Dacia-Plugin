@@ -1,5 +1,5 @@
 # Domoticz-Renault-Dacia-Plugin
-Plugin Domoticz afin d'obtenir les informations et piloter votre véhicule électrique Renault ou Dacia.
+Plugin Domoticz pour obtenir les informations et piloter les **Renault E-Tech nouvelle génération (KCM)** : Renault 5 (`R5E1VE`), Renault 4 (`A4E1VE`), Twingo. Fork recentré du plugin Renault/Dacia d'origine (la clé du plugin reste `domoticz-renault-dacia`).
 
 ## Nouveautés de ce fork (compatibilité Renault 5 E-Tech)
 
@@ -14,9 +14,12 @@ Ce fork ([lemassykoi/Domoticz-Renault-Dacia-Plugin](https://github.com/lemassyko
 | Localisation GPS | ✅ | ✅ |
 | Lancement de charge | ✅ | ✅ (allume le relais Shelly puis lance la charge) |
 | **Arrêt de charge** | ❌ `Endpoint 'actions/charge-stop' not available for model 'R5E1VE'` | ✅ **validé en réel** (planning → 0 W → coupure relais) |
-| **Recharge programmée** | ❌ (l'arrêt planifié plantait) | ✅ *(dépend de l'arrêt de charge)* |
+| **Cible de charge (socTarget)** | — | ✅ **nouveau** : lecture + réglage (sélecteur 50→100 %) |
 | Affichage *Branchée* / *Charge en cours* | Capteur texte | **Liste déroulante** (Selector Switch) |
+| Devices vides supprimés | Température / Énergie / Capacité / Puissance à 0 | ❌ retirés (données non fournies par la R5) |
 | Intervalle mini de polling | 10 min | **5 min** |
+
+> Ce fork est recentré sur les **Renault E-Tech nouvelle génération (KCM)** : R5, R4, Twingo. Les artefacts spécifiques Dacia Spring (page web, scripts dzVents, `plugin_hvac.py`) ont été retirés. La **clé du plugin reste inchangée** (`domoticz-renault-dacia`) : pas besoin de recréer le matériel.
 
 ### Pourquoi l'arrêt de charge plantait
 
@@ -94,19 +97,30 @@ Le plugin interroge l'API JSON de Domoticz en local :
 
 > ⚙️ *Détail technique* : ces deux valeurs utilisent en interne les champs `Mode6` (capteur puissance) et `Address` (relais) du framework de plugin Domoticz. Le champ `Address` a été détourné pour l'IDX relais car les autres champs texte disponibles ne convenaient pas (`SerialPort` s'affiche en menu déroulant de ports USB). Si votre interface web Domoticz utilise un port autre que 8080/80, ajoutez-le à `DOMOTICZ_PORT_CANDIDATES` dans `plugin.py`.
 
-### Migration des dispositifs « Branchée » et « Charge en cours »
+### Cible de charge (nouveau)
 
-Ces deux dispositifs passent de *capteur texte* à **liste déroulante** (Selector Switch) :
+Le dispositif **Cible de charge** (Unité 17, liste déroulante 50→100 %) reflète le `socTarget` du véhicule (lu à chaque actualisation) **et permet de le régler** : changer la valeur envoie `set_soc_levels` à l'API Renault (le `socMin` courant est conservé). Testé en réel : l'écriture est acceptée par la R5.
 
-- **Branchée** : `Débranchée` / `Branchée`
-- **Charge en cours** : `Arrêtée` / `En charge` / `Erreur`
+### Migration des dispositifs (installation existante)
 
-Sur une installation **existante**, ces dispositifs ne sont **pas** recréés automatiquement (Domoticz conserve les anciens). Pour bénéficier des listes déroulantes :
+Sur une installation **existante**, Domoticz conserve les anciens dispositifs ; le plugin ne recrée pas ceux qui existent déjà. Procédure de migration :
 
-1. Dans Domoticz, supprimer les deux dispositifs **Branchée** (Unité 6) et **Charge en cours** (Unité 7).
-2. Redémarrer le plugin (ou Domoticz). Ils seront recréés en Selector Switch.
+**1. Dispositifs à supprimer** (données non fournies par la R5, restaient à 0) :
 
-Sur une **nouvelle** installation, ils sont créés directement en listes déroulantes.
+- **Temperature batterie** (Unité 2)
+- **Energie batterie** (Unité 4)
+- **Capacité batterie** (Unité 5)
+- **Puissance de charge** (Unité 9) — la vraie puissance de charge est déjà mesurée par le Shelly (IDX capteur puissance)
+
+**2. Dispositifs à supprimer puis laisser recréer** (changement de type) :
+
+- **Branchée** (Unité 6) → liste déroulante `Débranchée` / `Branchée`
+- **Charge en cours** (Unité 7) → liste déroulante `Arrêtée` / `En charge` / `Erreur`
+- **Charge max programmée** (Unité 17) → remplacé par **Cible de charge** (liste déroulante 50→100 %)
+
+**3.** Redémarrer le plugin (ou Domoticz) : les Unités 6, 7 et 17 sont recréées au bon format.
+
+Sur une **nouvelle** installation, tout est créé directement au bon format (les dispositifs vides ne sont plus créés du tout).
 
 ### Comment tester l'arrêt de charge
 
@@ -129,22 +143,22 @@ L'API Kamereon de Renault **limite le nombre de requêtes à ~60 par heure** (au
 
 Une option **5 minutes** a été ajoutée (l'intervalle minimum était de 10 min).
 
-Estimation du coût par cycle selon le mode « Services actifs » choisi (≈ 1 requête de résolution du véhicule + 1 requête par service) :
+Estimation du coût par cycle selon le mode « Services actifs » choisi (≈ 1 requête de résolution du véhicule + 1 requête par service ; le mode Batterie ajoute aussi la lecture de la cible de charge `soc-levels`) :
 
 | Mode « Services actifs » | Requêtes/cycle (approx.) | À 5 min (12 cycles/h) | À 10 min (6 cycles/h) |
 |--------------------------|:------------------------:|:---------------------:|:---------------------:|
-| Cockpit + Batterie + Localisation (`111`) | ~4 | ~48/h | ~24/h |
-| Cockpit + Batterie (`110`) | ~3 | ~36/h | ~18/h |
-| Batterie seule (`010`) | ~2 | ~24/h | ~12/h |
+| Cockpit + Batterie + Localisation (`111`) | ~5 | ~60/h | ~30/h |
+| Cockpit + Batterie (`110`) | ~4 | ~48/h | ~24/h |
+| Batterie seule (`010`) | ~3 | ~36/h | ~18/h |
 
-⚠️ À 5 min en mode complet (`111`) on est **sous le plafond mais serré** : chaque commande manuelle (Mise à jour / Lancer / Arrêter la charge) déclenche un rafraîchissement complet qui consomme des requêtes supplémentaires. **En cas d'erreurs de quota**, augmentez l'intervalle ou réduisez les « Services actifs ».
+⚠️ À 5 min en mode complet (`111`) on **frôle le plafond** (~60/h) — d'autant que chaque commande manuelle (Mise à jour / Lancer / Arrêter / Cible de charge) déclenche un rafraîchissement complet. **En cas d'erreurs de quota**, passez à 10 min ou réduisez les « Services actifs ».
 
 ### Limites connues
 
 - L'arrêt de charge R5 **dépend du Shelly** (mesure de puissance + relais). Sans ces deux IDX configurés, l'arrêt automatique propre n'est pas possible.
 - Le seuil de détection d'arrêt est fixé à **10 W** (constantes `ZEROWATT_THRESHOLD`, `ZEROWATT_TIMEOUT=120s`, `ZEROWATT_INTERVAL=8s` dans `plugin.py`). Adaptez si votre borne consomme davantage en veille.
 - Pendant l'arrêt, le plugin **attend** le retour à ~0 W (jusqu'à 120 s) : la commande *Arrêter la charge* peut donc prendre jusqu'à ~2 min avant de rendre la main.
-- La « recharge programmée » du plugin est gérée **côté Domoticz** (dzVents planifie un ON puis un OFF), et non via l'API de planification native Renault. Elle dépend donc du bon fonctionnement des ordres de lancement/arrêt.
+- La **recharge programmée** (page web « Dacia » + scripts dzVents Lua) a été **retirée** de ce fork (spécifique Dacia Spring, plantait `onStart`). Pour programmer une charge, créez vos propres scénarios Domoticz (dzVents/Blockly) basés sur les dispositifs du plugin (*Lancer la charge* / *Arrêter la charge* / *Cible de charge*).
 - R4 E-Tech et Twingo ne sont **pas encore testées** ; le mécanisme (planning + relais) devrait s'appliquer si leur `actions/charge-stop` est aussi `None` et qu'elles exposent `ev/settings`.
 
 ## Prérequis
@@ -169,30 +183,33 @@ Par exemple sous debian :
 > Note : ce dépôt est un fork de [Kask29/Domoticz-Renault-Dacia-Plugin](https://github.com/Kask29/Domoticz-Renault-Dacia-Plugin) ajoutant la compatibilité Renault 5 E-Tech (voir « Nouveautés de ce fork » ci-dessus).
 
 ### Configuration
-Dans <i>Domoticz / Configuration / Matériel</i> --> ajouter le plugin de type <i>Renault / Dacia connect</i> en le nommant par exemple <b>Spring</b> et rentrez les informations nécessaires à son fonctionnement :
+Dans <i>Domoticz / Configuration / Matériel</i> --> ajouter le plugin de type <i>Renault E-Tech (R5 / R4 / Twingo) connect</i> en le nommant par exemple <b>R5</b> et rentrez les informations nécessaires à son fonctionnement :
 - email du compte Renault ou Dacia
 - mot de passe du compte Renault ou Dacia
 - Account id (votre account id peut être trouvé via l'API Renault en faisant : <code>renault-api accounts</code>
 - VIN (communiqué par le vendeur, sur la carte grise, dans l'appli puis Informations)
-- La capacité de la batterie (afin d'estimer les temps de charge)
 - La fréquence d'actualisation des dispositifs
+- Les 2 IDX Shelly (capteur puissance + relais) — voir « Nouveaux paramètres de configuration » ci-dessus
 ![image](https://github.com/Kask29/Domoticz-Renault-Dacia-Plugin/assets/98609356/9f06d1cf-8e75-4905-88ab-08e0b9a5cff9)
 
 
-Une fois ajouté, le plugin va créer seul :
-- les Dispositifs nécessaires disponibles dans Interrupteurs et Mesures (ne pas les renommer, ni les supprimer, ni les mettre en non-utilisé. Pour les masquer, mettez les en <i>$Hidden</i> depuis <i>Plan</i>) :
-![image](https://user-images.githubusercontent.com/98609356/229288896-56fa6ab4-62df-4cf7-88b2-3865c087a7d9.png)
-![image](https://user-images.githubusercontent.com/98609356/229289047-854ee78b-bed2-44c8-a70c-5bc72ca0bf19.png)
-- le dzEvent qui permet de programmer la charge (départ et arrêt à un moment donné, avec estimation de la charge obtenue)
-- la page web qui permet de créer la tâche planifiée (disponible dans les pages personnalisée, pensez à activer l'onglet)
-![image](https://user-images.githubusercontent.com/98609356/229289207-134981ef-6f78-458a-8f0b-422041f6c62a.png)
+Une fois ajouté, le plugin crée seul les dispositifs nécessaires (disponibles dans *Interrupteurs* et *Mesures*). Ne pas les renommer, ni les supprimer, ni les mettre en non-utilisé ; pour les masquer, mettez-les en <i>$Hidden</i> depuis <i>Plan</i>.
 
+Dispositifs créés (véhicules KCM) : *Batterie %*, *Autonomie*, *Branchée* (liste déroulante), *Charge en cours* (liste déroulante), *Temps charge restant*, *Compteur km*, *Localisation*, *Mise à jour*, *Lancer la charge*, *Arrêter la charge*, *Cible de charge* (liste déroulante 50→100 %).
 
-Toute nouvelle planification annule la planifiation précédente.
-
-La planification n'est valable qu'une seule fois, mais rien ne vous empêche de créer vos scénarios personnalisés (comme habituellement avec Domoticz) basés sur les dispositifs du plugin.
+> Note : ce fork ne déploie plus la page web ni les scripts dzVents de « recharge programmée » (voir *Limites connues*). Créez vos propres scénarios Domoticz basés sur les dispositifs du plugin.
 
 ## Changelog
+
+### v1.2.0 (fork lemassykoi) — recentrage R5/KCM + cible de charge + ménage
+
+- **Recentrage** sur les Renault E-Tech nouvelle génération (KCM : R5, R4, Twingo). Nom du plugin renommé (« Renault E-Tech (R5 / R4 / Twingo) connect »), **clé inchangée** (`domoticz-renault-dacia`) → pas de recréation du matériel.
+- **Nouveau : Cible de charge** (Unité 17, sélecteur 50→100 %) en **lecture + écriture** via `soc-levels` (`socTarget`). Écriture validée en réel sur la R5. Remplace l'ancien sélecteur « Charge max programmée » (orphelin depuis le retrait des scripts dzVents).
+- **Suppression des dispositifs vides** non fournis par la R5 : *Temperature batterie* (2), *Energie batterie* (4), *Capacité batterie* (5), *Puissance de charge* (9). La puissance de charge réelle vient du Shelly.
+- **Suppression du paramètre** « Capacité de la batterie » (Mode3), devenu inutile.
+- **Nettoyage du dépôt** : retrait de `plugin_hvac.py`, `Dacia.html`, icônes et scripts dzVents Dacia (`.lua`). Ces ressources plantaient `onStart` (dossier `./plugins/Dacia/` inexistant) et étaient spécifiques Dacia Spring.
+- Données API R5 étudiées : `internalTemperature` écartée (valeur périmée + fausse d'un facteur ~10) ; pression pneus / verrouillage / alertes non fournies par la R5.
+- Quota API : la lecture de la cible de charge ajoute ~1 requête/cycle (voir tableau mis à jour).
 
 ### v1.1.0 (fork lemassykoi) — arrêt de charge R5 validé en réel
 
